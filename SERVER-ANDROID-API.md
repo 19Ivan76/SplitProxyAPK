@@ -1,89 +1,164 @@
-# Что требуется серверу для SplitProxyAPK 0.1.0
+package ru.splitproxy.apk;
 
-APK не подключается к PostgreSQL напрямую. Единственная постоянная точка — `https://split-proxy.ru/api/v1/`.
+import android.content.Context;
+import android.os.Build;
 
-## Уже используемые контракты из браузерного расширения
+import org.json.JSONArray;
+import org.json.JSONObject;
 
-### Регистрация / вход
+public final class SessionManager {
+    private final Context context;
+    private final SecureStore store;
+    private final ServerGateway gateway;
 
-- `POST auth/register`
-  - `name`
-  - `email`
-  - `password`
-  - `password_confirmation`
-- `POST auth/login`
-  - ожидается `access_token`
-  - ожидается `user.name`, `user.email`
-- `GET auth/me`
-- `POST auth/logout`
+    public SessionManager(Context context) {
+        this.context = context.getApplicationContext();
+        this.store = new SecureStore(this.context);
+        this.gateway = new ServerGateway();
+    }
 
-### Техническая активация установки
+    public AccountResult login(String email, String password) throws Exception {
+        JSONObject login = gateway.login(email, password);
+        return finishAccountLogin(login);
+    }
 
-APK использует тот же криптографический протокол, что Chromium 1.1.3:
+    public AccountResult register(String name, String email, String password) throws Exception {
+        gateway.register(name, email, password);
+        JSONObject login = gateway.login(email, password);
+        return finishAccountLogin(login);
+    }
 
-1. `POST guest/devices/challenge`
-   - `install_id`
-   - `platform: android`
-   - `client_type: android`
-   - `public_key`: PEM/SPKI P-256
-2. Каноническая строка подписи:
+    private AccountResult finishAccountLogin(JSONObject login) throws Exception {
+        String accountToken = login.optString("access_token", "");
+        if (accountToken.isEmpty()) throw new IllegalStateException("Сервер не вернул токен аккаунта");
 
-   `SP-GUEST-ACTIVATE-V1\n{install_id}\n{CHALLENGE_UPPERCASE}`
+        JSONObject user = login.optJSONObject("user");
+        String name = user == null ? "" : user.optString("name", "");
+        String email = user == null ? "" : user.optString("email", "");
 
-3. `POST guest/devices/activate`
-   - `install_id`
-   - `challenge`
-   - `signature`: Base64 от 64 байт P1363 `r||s`
-4. ожидаются:
-   - `status: guest`
-   - `key_id`
-   - `device_token`
+        try {
+            DeviceIdentity identity = DeviceIdentity.ensure(context);
+            ensureActivatedForAccount(identity, accountToken);
+            store.saveAccount(accountToken, name, email);
+            return new AccountResult(name, email);
+        } catch (Exception error) {
+            try { gateway.logout(accountToken); } catch (Exception ignored) {}
+            throw error;
+        }
+    }
 
-Это только техническая регистрация установки. До входа пользователя Android-клиент не запрашивает рабочую VPN-конфигурацию и не позволяет выбрать приложения.
+    private void ensureActivatedForAccount(DeviceIdentity identity, String accountToken) throws Exception {
+        String keyId = store.getDeviceKeyId();
+        String deviceToken = store.getDeviceToken();
 
-### Привязка после входа
+        if (keyId != null && !keyId.isEmpty() && deviceToken != null && !deviceToken.isEmpty()) {
+            verifyExistingDeviceOwnership(identity.installId, accountToken);
+            return;
+        }
 
-`POST guest/claim`
+        String deviceName = buildDeviceName();
+        JSONObject requested = gateway.activationRequest(identity, deviceName);
+        String requestCode = requested.optString("request_code", "");
+        if (!requestCode.matches("(?i)^SP-([a-f0-9]{4}-){4}[a-f0-9]{4}$")) {
+            throw new IllegalStateException("Сервер вернул неверный код запроса активации");
+        }
 
-- `Authorization: Bearer <account token>`
-- `X-Guest-Device-Key: <key_id>`
-- `X-Guest-Device-Token: <device_token>`
+        JSONObject approved = gateway.activationApprove(requestCode, accountToken);
+        String responseCode = approved.optString("response_code", "");
+        if (!responseCode.matches("(?i)^ACT-(?:[a-f0-9]{4}-){7}[a-f0-9]{4}$")) {
+            throw new IllegalStateException("Сервер вернул неверный код подтверждения активации");
+        }
 
-Сервер должен разрешить claim для `platform=android`.
+        String signature = identity.signActivationResponseCode(responseCode);
+        JSONObject finished = gateway.activationFinish(identity.installId, responseCode, signature);
+        if (!"active".equals(finished.optString("status", ""))) {
+            throw new IllegalStateException("Сервер не активировал устройство");
+        }
 
-## Конфигурация VPN
+        String activatedKeyId = finished.optString("key_id", "");
+        String activatedToken = finished.optString("device_token", "");
+        if (!activatedKeyId.matches("^SP-[A-F0-9]{32}$")
+                || !activatedToken.matches("^[a-f0-9]{64}$")) {
+            throw new IllegalStateException("Сервер вернул неверные учётные данные устройства");
+        }
 
-На первом этапе APK вызывает уже существующий:
+        store.saveDeviceSession(activatedKeyId, activatedToken);
+    }
 
-`GET devices/proxy/config?country=NL`
+    private void verifyExistingDeviceOwnership(String installId, String accountToken) throws Exception {
+        JSONObject response = gateway.devices(accountToken);
+        JSONArray devices = response.optJSONArray("devices");
+        if (devices == null) {
+            throw new IllegalStateException("Сервер не вернул список устройств аккаунта");
+        }
 
-Headers:
+        for (int i = 0; i < devices.length(); i++) {
+            JSONObject device = devices.optJSONObject(i);
+            if (device == null) continue;
+            if (installId.equals(device.optString("install_id", ""))) {
+                if ("active".equals(device.optString("status", ""))) return;
+                throw new IllegalStateException("Эта установка Android отозвана или неактивна");
+            }
+        }
 
-- `Authorization: Bearer <device_token>`
-- `X-Device-Key: <key_id>`
+        throw new IllegalStateException("Эта установка Android уже привязана к другому аккаунту или недоступна");
+    }
 
-Для Android ответ обязан содержать минимум:
+    private static String buildDeviceName() {
+        String manufacturer = Build.MANUFACTURER == null ? "" : Build.MANUFACTURER.trim();
+        String model = Build.MODEL == null ? "" : Build.MODEL.trim();
+        String value = (manufacturer + " " + model).trim();
+        if (value.isEmpty()) value = "Android";
+        if (value.length() > 150) value = value.substring(0, 150);
+        return value;
+    }
 
-```json
-{
-  "proxy": {
-    "server": "proxy.example.net",
-    "port": 28443,
-    "scheme": "http",
-    "entry_node": "rf2",
-    "exit_node": "nd"
-  },
-  "exit_country": "NL",
-  "available_exit_countries": ["NL"]
+    public AccountResult restoreCachedAccount() {
+        return new AccountResult(store.getUserName(), store.getUserEmail());
+    }
+
+    public boolean isLoggedIn() {
+        return store.isLoggedIn();
+    }
+
+    public void validateAccountIfPossible() throws Exception {
+        String token = store.getAccountToken();
+        if (token == null || token.isEmpty()) return;
+        try {
+            JSONObject response = gateway.me(token);
+            JSONObject user = response.optJSONObject("user");
+            if (user == null && response.has("email")) user = response;
+            if (user != null) {
+                store.saveAccount(token,
+                        user.optString("name", store.getUserName()),
+                        user.optString("email", store.getUserEmail()));
+            }
+        } catch (ApiException e) {
+            if (e.status == 401) store.clearAccount();
+            else throw e;
+        }
+    }
+
+    public void logout() throws Exception {
+        String token = store.getAccountToken();
+        try {
+            if (token != null && !token.isEmpty()) gateway.logout(token);
+        } catch (ApiException e) {
+            if (e.status != 401) throw e;
+        } finally {
+            // Device credentials remain: this installation stays activated.
+            // A subsequent login is accepted only for the owning account.
+            store.clearAccount();
+        }
+    }
+
+    public static final class AccountResult {
+        public final String name;
+        public final String email;
+
+        public AccountResult(String name, String email) {
+            this.name = name == null ? "" : name;
+            this.email = email == null ? "" : email;
+        }
+    }
 }
-```
-
-`server` и `port` не должны быть зашиты в APK.
-
-### Критично
-
-Браузерный `devices/proxy/config` сейчас связан с PAC и сайтами. Для Android VPN список браузерных сайтов не должен определять доступность прокси. Если существующий route невозможно безопасно сделать общим, нужен отдельный серверный route для Android. Его URL нужно согласовать до изменения APK — не придумывать клиентом самостоятельно.
-
-## Лимиты устройств
-
-Нужно отдельно определить серверное правило для Android-установок. Сейчас APK при HTTP 422 на `guest/claim` сообщает пользователю, что достигнут лимит и старое устройство нужно отозвать в личном кабинете. Автоматическую замену устройства в 0.1.0 не реализуем до точного контракта сервера.
