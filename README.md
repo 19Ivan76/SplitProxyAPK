@@ -1,4 +1,4 @@
-# SplitProxyAPK 0.1.1
+# SplitProxyAPK 0.1.2
 
 Исправлена последовательность авторизации/активации Android.
 
@@ -20,4 +20,9 @@ VPN по-прежнему получает адрес/порт только с A
 
 ## Сборка
 
-GitHub Actions: `.github/workflows/build-apk.yml` → artifact `SplitProxyAPK-v0.1.1-debug`.
+GitHub Actions: `.github/workflows/build-apk.yml` → artifact `SplitProxyAPK-v0.1.2-debug`.
+
+
+## v0.1.2
+
+Исправлено сохранение токенов через AndroidKeyStore AES-GCM: IV для шифрования теперь генерирует сам AndroidKeyStore; сохранение пары device key/token выполняется атомарно.

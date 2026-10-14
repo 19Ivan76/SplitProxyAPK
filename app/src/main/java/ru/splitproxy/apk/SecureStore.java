@@ -8,7 +8,6 @@ import android.util.Base64;
 
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
-import java.security.SecureRandom;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -42,16 +41,37 @@ public final class SecureStore {
     }
 
     public void saveDeviceSession(String keyId, String deviceToken) {
-        putSecret(KEY_DEVICE_ID, keyId);
-        putSecret(KEY_DEVICE_TOKEN, deviceToken);
+        if (keyId == null || deviceToken == null) {
+            throw new IllegalArgumentException("Пустые учётные данные устройства");
+        }
+        try {
+            String encryptedKeyId = encrypt(keyId);
+            String encryptedToken = encrypt(deviceToken);
+            boolean saved = prefs.edit()
+                    .putString(KEY_DEVICE_ID, encryptedKeyId)
+                    .putString(KEY_DEVICE_TOKEN, encryptedToken)
+                    .commit();
+            if (!saved) throw new IllegalStateException("SharedPreferences commit failed");
+        } catch (Exception e) {
+            throw new IllegalStateException("Не удалось сохранить защищённые данные", e);
+        }
     }
 
     public void saveAccount(String token, String name, String email) {
-        putSecret(KEY_ACCOUNT_TOKEN, token);
-        prefs.edit()
-                .putString(KEY_USER_NAME, name == null ? "" : name)
-                .putString(KEY_USER_EMAIL, email == null ? "" : email)
-                .commit();
+        if (token == null || token.isEmpty()) {
+            throw new IllegalArgumentException("Пустой токен аккаунта");
+        }
+        try {
+            String encryptedToken = encrypt(token);
+            boolean saved = prefs.edit()
+                    .putString(KEY_ACCOUNT_TOKEN, encryptedToken)
+                    .putString(KEY_USER_NAME, name == null ? "" : name)
+                    .putString(KEY_USER_EMAIL, email == null ? "" : email)
+                    .commit();
+            if (!saved) throw new IllegalStateException("SharedPreferences commit failed");
+        } catch (Exception e) {
+            throw new IllegalStateException("Не удалось сохранить защищённые данные", e);
+        }
     }
 
     public void clearAccount() {
@@ -62,26 +82,25 @@ public final class SecureStore {
                 .commit();
     }
 
-    private void putSecret(String key, String value) {
-        if (value == null) {
-            prefs.edit().remove(key).commit();
-            return;
+    private String encrypt(String value) throws Exception {
+        SecretKey secretKey = getOrCreateKey();
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+
+        // AndroidKeyStore with randomized encryption rejects a caller-supplied IV
+        // for ENCRYPT_MODE. Let the provider generate a secure random IV.
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey);
+        byte[] iv = cipher.getIV();
+        if (iv == null || iv.length < 12) {
+            throw new IllegalStateException("AndroidKeyStore did not provide a GCM IV");
         }
-        try {
-            SecretKey secretKey = getOrCreateKey();
-            byte[] iv = new byte[12];
-            new SecureRandom().nextBytes(iv);
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey, new GCMParameterSpec(128, iv));
-            byte[] encrypted = cipher.doFinal(value.getBytes(StandardCharsets.UTF_8));
-            byte[] packed = new byte[1 + iv.length + encrypted.length];
-            packed[0] = 1;
-            System.arraycopy(iv, 0, packed, 1, iv.length);
-            System.arraycopy(encrypted, 0, packed, 1 + iv.length, encrypted.length);
-            prefs.edit().putString(key, Base64.encodeToString(packed, Base64.NO_WRAP)).commit();
-        } catch (Exception e) {
-            throw new IllegalStateException("Не удалось сохранить защищённые данные", e);
-        }
+
+        byte[] encrypted = cipher.doFinal(value.getBytes(StandardCharsets.UTF_8));
+        byte[] packed = new byte[2 + iv.length + encrypted.length];
+        packed[0] = 2;
+        packed[1] = (byte) iv.length;
+        System.arraycopy(iv, 0, packed, 2, iv.length);
+        System.arraycopy(encrypted, 0, packed, 2 + iv.length, encrypted.length);
+        return Base64.encodeToString(packed, Base64.NO_WRAP);
     }
 
     private String getSecret(String key) {
@@ -89,11 +108,33 @@ public final class SecureStore {
         if (encoded == null) return null;
         try {
             byte[] packed = Base64.decode(encoded, Base64.NO_WRAP);
-            if (packed.length < 14 || packed[0] != 1) return null;
-            byte[] iv = new byte[12];
-            byte[] encrypted = new byte[packed.length - 13];
-            System.arraycopy(packed, 1, iv, 0, 12);
-            System.arraycopy(packed, 13, encrypted, 0, encrypted.length);
+            if (packed.length < 15) return null;
+
+            int version = packed[0] & 0xff;
+            final int ivOffset;
+            final int ivLength;
+            final int encryptedOffset;
+
+            if (version == 1) {
+                // Read compatibility with v0.1.1, if any value was successfully written.
+                ivOffset = 1;
+                ivLength = 12;
+                encryptedOffset = 13;
+            } else if (version == 2) {
+                ivLength = packed[1] & 0xff;
+                if (ivLength < 12 || ivLength > 32) return null;
+                ivOffset = 2;
+                encryptedOffset = 2 + ivLength;
+            } else {
+                return null;
+            }
+
+            if (packed.length <= encryptedOffset) return null;
+            byte[] iv = new byte[ivLength];
+            byte[] encrypted = new byte[packed.length - encryptedOffset];
+            System.arraycopy(packed, ivOffset, iv, 0, ivLength);
+            System.arraycopy(packed, encryptedOffset, encrypted, 0, encrypted.length);
+
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
             cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), new GCMParameterSpec(128, iv));
             return new String(cipher.doFinal(encrypted), StandardCharsets.UTF_8);
@@ -108,7 +149,9 @@ public final class SecureStore {
         if (keyStore.containsAlias(AES_ALIAS)) {
             return ((KeyStore.SecretKeyEntry) keyStore.getEntry(AES_ALIAS, null)).getSecretKey();
         }
-        KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
+
+        KeyGenerator generator = KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
         generator.init(new KeyGenParameterSpec.Builder(
                 AES_ALIAS,
                 KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
